@@ -1,6 +1,11 @@
 import Foundation
 
 actor RSIAuthService: AuthenticationServicing {
+    private enum FailureContext {
+        case signIn
+        case twoFactor
+    }
+
     private static let signInMutation = """
     mutation signin(
       $captcha_code: String
@@ -98,8 +103,9 @@ actor RSIAuthService: AuthenticationServicing {
         }
 
         throw AuthenticationError.signInFailed(
-            message(
+            presentableMessage(
                 for: errors,
+                context: .signIn,
                 fallback: "RSI rejected the sign-in attempt. Check the account email or Login ID and password, then try again."
             )
         )
@@ -156,8 +162,9 @@ actor RSIAuthService: AuthenticationServicing {
         }
 
         throw AuthenticationError.signInFailed(
-            message(
+            presentableMessage(
                 for: errors,
+                context: .twoFactor,
                 fallback: "The verification code could not be accepted. Try again."
             )
         )
@@ -213,22 +220,79 @@ actor RSIAuthService: AuthenticationServicing {
         )
     }
 
-    private func message(for errors: [GraphQLError], fallback: String) -> String {
-        for error in errors {
-            if error.category == "obfuscated" {
-                continue
-            }
+    private func presentableMessage(for errors: [GraphQLError], context: FailureContext, fallback: String) -> String {
+        if let friendlyMessage = friendlyMessage(for: errors, context: context) {
+            return friendlyMessage
+        }
 
-            if let detailMessage = error.detailMessage {
-                return detailMessage
-            }
-
-            if error.message != "ErrValidationFailed", error.message != "MultiStepRequired", !error.message.isEmpty {
-                return error.message
-            }
+        if let rawMessage = rawMessage(for: errors) {
+            return rawMessage
         }
 
         return fallback
+    }
+
+    private func friendlyMessage(for errors: [GraphQLError], context: FailureContext) -> String? {
+        let normalized = errors
+            .filter { $0.category != "obfuscated" }
+            .map(\.normalizedSearchText)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+
+        guard !normalized.isEmpty else {
+            return nil
+        }
+
+        if normalized.contains("1034")
+            || normalized.contains("maximum number of failed login attempts exceeded")
+            || normalized.contains("too many failed login attempts")
+            || normalized.contains("failed login attempts exceeded") {
+            return "Too many login attempts. RSI temporarily locked this account. Wait about an hour before trying again."
+        }
+
+        if normalized.contains("invalidpasswordexception")
+            || normalized.contains("incorrect username/password")
+            || normalized.contains("wrong credentials")
+            || normalized.contains("wrong password")
+            || normalized.contains("invalid password") {
+            return "Incorrect RSI email/Login ID or password. Check your credentials and try again."
+        }
+
+        if normalized.contains("invalid or already used")
+            || normalized.contains("invalid code")
+            || normalized.contains("incorrect code")
+            || normalized.contains("already used")
+            || normalized.contains("expired code") {
+            switch context {
+            case .signIn:
+                return "The verification step was not accepted. Try signing in again."
+            case .twoFactor:
+                return "That verification code was not accepted. Use the newest RSI code and try again."
+            }
+        }
+
+        if normalized.contains("captcha") || normalized.contains("recaptcha") {
+            return "RSI requested an additional CAPTCHA challenge. Try signing in again in a fresh session."
+        }
+
+        if normalized.contains("csrf") {
+            return "The verification session expired. Start the sign-in flow again."
+        }
+
+        return nil
+    }
+
+    private func rawMessage(for errors: [GraphQLError]) -> String? {
+        let renderedErrors = errors
+            .filter { $0.category != "obfuscated" }
+            .map(\.renderedDescription)
+            .filter { !$0.isEmpty }
+
+        guard !renderedErrors.isEmpty else {
+            return nil
+        }
+
+        return renderedErrors.joined(separator: "\n\n")
     }
 
     private func makeDecodeError(
@@ -296,6 +360,40 @@ private nonisolated struct GraphQLError: Decodable {
         extensions?.details?.firstNonEmptyString
     }
 
+    var normalizedSearchText: String {
+        let segments = [message, code?.firstNonEmptyString, category] + detailStrings.map(Optional.some)
+
+        return segments
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+            .lowercased()
+    }
+
+    var renderedDescription: String {
+        var segments: [String] = []
+
+        if !message.isEmpty, message != "ErrValidationFailed" {
+            segments.append(message)
+        }
+
+        if let codeValue = code?.firstNonEmptyString,
+           !codeValue.isEmpty,
+           codeValue.caseInsensitiveCompare(message) != .orderedSame {
+            segments.append("code: \(codeValue)")
+        }
+
+        if let category, !category.isEmpty {
+            segments.append("category: \(category)")
+        }
+
+        if let details = extensions?.details?.renderedSingleLine, !details.isEmpty {
+            segments.append("details: \(details)")
+        }
+
+        return segments.joined(separator: " | ")
+    }
+
     var hasExpiredCSRFContext: Bool {
         guard case let .object(values)? = extensions?.details,
               let csrfTokenState = values["csrfToken"]?.stringValue else {
@@ -303,6 +401,10 @@ private nonisolated struct GraphQLError: Decodable {
         }
 
         return csrfTokenState == "Invalid" || csrfTokenState == "Required"
+    }
+
+    private var detailStrings: [String] {
+        extensions?.details?.allNonEmptyStrings ?? []
     }
 }
 
@@ -372,6 +474,48 @@ private nonisolated enum GraphQLJSONValue: Codable {
             return nil
         case .null:
             return nil
+        }
+    }
+
+    var allNonEmptyStrings: [String] {
+        switch self {
+        case .string, .int, .double, .bool:
+            return firstNonEmptyString.map { [$0] } ?? []
+        case let .object(values):
+            return values.keys.sorted().flatMap { key in
+                values[key]?.allNonEmptyStrings ?? []
+            }
+        case let .array(values):
+            return values.flatMap(\.allNonEmptyStrings)
+        case .null:
+            return []
+        }
+    }
+
+    var renderedSingleLine: String {
+        switch self {
+        case .string, .int, .double, .bool:
+            return firstNonEmptyString ?? ""
+        case let .object(values):
+            return values.keys.sorted().compactMap { key in
+                guard let value = values[key] else {
+                    return nil
+                }
+
+                let renderedValue = value.renderedSingleLine
+                guard !renderedValue.isEmpty else {
+                    return nil
+                }
+
+                return "\(key)=\(renderedValue)"
+            }.joined(separator: ", ")
+        case let .array(values):
+            return values
+                .map(\.renderedSingleLine)
+                .filter { !$0.isEmpty }
+                .joined(separator: ", ")
+        case .null:
+            return ""
         }
     }
 

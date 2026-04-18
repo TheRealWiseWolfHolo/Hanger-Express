@@ -115,16 +115,16 @@ struct AuthenticationErrorPresentation: Sendable {
 }
 
 enum AuthenticationDebugFormatter {
-    private static let javaScriptExceptionKeys = [
+    nonisolated private static let javaScriptExceptionKeys = [
         "WKJavaScriptExceptionMessage",
         "WKJavaScriptExceptionLineNumber",
         "WKJavaScriptExceptionColumnNumber",
         "WKJavaScriptExceptionSourceURL"
     ]
 
-    static func present(_ error: Error) -> AuthenticationErrorPresentation {
-        let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+    nonisolated static func present(_ error: Error) -> AuthenticationErrorPresentation {
         let debugDetails = debugDescription(for: error)
+        let message = preferredMessage(for: error, debugDetails: debugDetails)
 
         return AuthenticationErrorPresentation(
             message: message,
@@ -132,13 +132,37 @@ enum AuthenticationDebugFormatter {
         )
     }
 
-    static func debugDescription(for error: Error) -> String {
+    nonisolated private static func preferredMessage(for error: Error, debugDetails: String) -> String {
+        if let message = (error as? AuthenticationError)?.errorDescription?.trimmedNonEmpty {
+            return message
+        }
+
+        let nsError = error as NSError
+
+        if let javaScriptMessage = javaScriptSummary(from: nsError) {
+            return javaScriptMessage
+        }
+
+        if let responseBody = rsiResponseBody(from: nsError) {
+            let localizedDescription = nsError.localizedDescription.trimmedNonEmpty ?? "RSI returned an unexpected response."
+            return "\(localizedDescription)\n\n\(responseBody)"
+        }
+
+        if let localizedDescription = nsError.localizedDescription.trimmedNonEmpty,
+           !isGenericMessage(localizedDescription) {
+            return localizedDescription
+        }
+
+        return debugDetails
+    }
+
+    nonisolated static func debugDescription(for error: Error) -> String {
         var lines: [String] = []
         append(error, title: "Error", into: &lines, indent: "")
         return lines.joined(separator: "\n")
     }
 
-    private static func append(_ error: Error, title: String, into lines: inout [String], indent: String) {
+    nonisolated private static func append(_ error: Error, title: String, into lines: inout [String], indent: String) {
         let nsError = error as NSError
 
         lines.append("\(indent)\(title)")
@@ -169,7 +193,7 @@ enum AuthenticationDebugFormatter {
         }
     }
 
-    private static func javaScriptDetails(from error: NSError) -> [String] {
+    nonisolated private static func javaScriptDetails(from error: NSError) -> [String] {
         javaScriptExceptionKeys.compactMap { key in
             guard let value = error.userInfo[key] else {
                 return nil
@@ -179,7 +203,7 @@ enum AuthenticationDebugFormatter {
         }
     }
 
-    private static func renderUserInfo(_ userInfo: [String: Any]) -> [String] {
+    nonisolated private static func renderUserInfo(_ userInfo: [String: Any]) -> [String] {
         userInfo.keys.sorted().compactMap { key in
             guard key != NSUnderlyingErrorKey else {
                 return nil
@@ -193,7 +217,7 @@ enum AuthenticationDebugFormatter {
         }
     }
 
-    private static func render(_ value: Any) -> String {
+    nonisolated private static func render(_ value: Any) -> String {
         if let error = value as? NSError {
             return "\(error.domain) (\(error.code)): \(error.localizedDescription)"
         }
@@ -216,7 +240,7 @@ enum AuthenticationDebugFormatter {
         return String(describing: value)
     }
 
-    private static func webKitCodeName(for error: NSError) -> String? {
+    nonisolated private static func webKitCodeName(for error: NSError) -> String? {
         guard error.domain == WKErrorDomain,
               let code = WKError.Code(rawValue: error.code) else {
             return nil
@@ -260,5 +284,59 @@ enum AuthenticationDebugFormatter {
         @unknown default:
             return "unknownFutureWKError"
         }
+    }
+
+    nonisolated private static func javaScriptSummary(from error: NSError) -> String? {
+        guard let message = error.userInfo["WKJavaScriptExceptionMessage"] as? String else {
+            return nil
+        }
+
+        let trimmedMessage = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedMessage.isEmpty else {
+            return nil
+        }
+
+        var summary = "JavaScript error: \(trimmedMessage)"
+
+        if let lineNumber = error.userInfo["WKJavaScriptExceptionLineNumber"] {
+            summary.append(" (line \(render(lineNumber))")
+
+            if let columnNumber = error.userInfo["WKJavaScriptExceptionColumnNumber"] {
+                summary.append(", column \(render(columnNumber))")
+            }
+
+            summary.append(")")
+        }
+
+        return summary
+    }
+
+    nonisolated private static func rsiResponseBody(from error: NSError) -> String? {
+        guard error.domain == "RSIAuthService",
+              let rawBody = error.userInfo["RSIResponseBody"] as? String else {
+            return nil
+        }
+
+        let trimmedBody = rawBody.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedBody.isEmpty else {
+            return nil
+        }
+
+        return trimmedBody
+    }
+
+    nonisolated private static func isGenericMessage(_ message: String) -> Bool {
+        let normalized = message.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized.isEmpty
+            || normalized == "the operation couldn’t be completed."
+            || normalized == "the operation could not be completed."
+            || normalized == "unknown error"
+    }
+}
+
+private extension String {
+    nonisolated var trimmedNonEmpty: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }

@@ -74,9 +74,25 @@ struct Hanger_ExpressTests {
 
         let presentation = AuthenticationDebugFormatter.present(error)
 
-        #expect(presentation.message == "A JavaScript exception occurred")
+        #expect(presentation.message == "JavaScript error: Can't find variable: arguments (line 1, column 18)")
         #expect(presentation.debugDetails?.contains("javaScriptExceptionOccurred") == true)
         #expect(presentation.debugDetails?.contains("Can't find variable: arguments") == true)
+    }
+
+    @Test func authenticationDebugFormatterShowsRawRSIResponseBodyForUnexpectedResponses() async throws {
+        let error = NSError(
+            domain: "RSIAuthService",
+            code: 200,
+            userInfo: [
+                NSLocalizedDescriptionKey: "RSI returned a response the app could not decode yet.",
+                "RSIResponseBody": #"{"errors":[{"message":"SomethingNew","extensions":{"details":{"reason":"backend surprise"}}}]}"#
+            ]
+        )
+
+        let presentation = AuthenticationDebugFormatter.present(error)
+
+        #expect(presentation.message.contains("RSI returned a response the app could not decode yet."))
+        #expect(presentation.message.contains(#""message":"SomethingNew""#))
     }
 
     @Test func signInAcceptsTwoFactorResponsesWithFlexibleGraphQLPayloads() async throws {
@@ -120,6 +136,219 @@ struct Hanger_ExpressTests {
             #expect(true)
         case .authenticated:
             Issue.record("Expected the auth flow to require a verification code.")
+        }
+    }
+
+    @Test func signInHumanizesInvalidCredentialsErrors() async throws {
+        let webSession = FakeAuthenticationWebSession(
+            signInResponse: BrowserGraphQLResponse(
+                statusCode: 200,
+                body: """
+                {
+                  "data": {
+                    "account_signin": null
+                  },
+                  "errors": [
+                    {
+                      "message": "InvalidPasswordException",
+                      "extensions": {
+                        "category": "authorization",
+                        "details": {
+                          "password": "Invalid"
+                        }
+                      }
+                    }
+                  ]
+                }
+                """
+            )
+        )
+
+        let service = RSIAuthService(recaptchaBroker: webSession)
+
+        do {
+            try await service.signIn(
+                loginIdentifier: "pilot@example.com",
+                password: "wrong-password",
+                rememberMe: true
+            )
+            Issue.record("Expected invalid credentials to throw an authentication error.")
+        } catch let error as AuthenticationError {
+            guard case let .signInFailed(message) = error else {
+                Issue.record("Expected a sign-in failure message, got \(error).")
+                return
+            }
+
+            #expect(message == "Incorrect RSI email/Login ID or password. Check your credentials and try again.")
+        } catch {
+            Issue.record("Expected AuthenticationError, got \(error).")
+        }
+    }
+
+    @Test func signInHumanizesTooManyAttemptsErrors() async throws {
+        let webSession = FakeAuthenticationWebSession(
+            signInResponse: BrowserGraphQLResponse(
+                statusCode: 200,
+                body: """
+                {
+                  "data": {
+                    "account_signin": null
+                  },
+                  "errors": [
+                    {
+                      "message": "ErrValidationFailed",
+                      "extensions": {
+                        "category": "authorization",
+                        "details": {
+                          "form": "Error Code 1034 - Maximum number of failed login attempts exceeded"
+                        }
+                      }
+                    }
+                  ]
+                }
+                """
+            )
+        )
+
+        let service = RSIAuthService(recaptchaBroker: webSession)
+
+        do {
+            try await service.signIn(
+                loginIdentifier: "pilot@example.com",
+                password: "wrong-password",
+                rememberMe: true
+            )
+            Issue.record("Expected RSI lockout to throw an authentication error.")
+        } catch let error as AuthenticationError {
+            guard case let .signInFailed(message) = error else {
+                Issue.record("Expected a sign-in failure message, got \(error).")
+                return
+            }
+
+            #expect(message == "Too many login attempts. RSI temporarily locked this account. Wait about an hour before trying again.")
+        } catch {
+            Issue.record("Expected AuthenticationError, got \(error).")
+        }
+    }
+
+    @Test func signInSurfacesUnknownRSIErrorsWithoutGenericFallback() async throws {
+        let webSession = FakeAuthenticationWebSession(
+            signInResponse: BrowserGraphQLResponse(
+                statusCode: 200,
+                body: """
+                {
+                  "data": {
+                    "account_signin": null
+                  },
+                  "errors": [
+                    {
+                      "message": "SomethingBrandNew",
+                      "code": "ZX-42",
+                      "extensions": {
+                        "category": "backend",
+                        "details": {
+                          "reason": "Unexpected upstream rejection"
+                        }
+                      }
+                    }
+                  ]
+                }
+                """
+            )
+        )
+
+        let service = RSIAuthService(recaptchaBroker: webSession)
+
+        do {
+            try await service.signIn(
+                loginIdentifier: "pilot@example.com",
+                password: "secret-password",
+                rememberMe: true
+            )
+            Issue.record("Expected the unknown RSI error to throw an authentication error.")
+        } catch let error as AuthenticationError {
+            guard case let .signInFailed(message) = error else {
+                Issue.record("Expected a sign-in failure message, got \(error).")
+                return
+            }
+
+            #expect(message.contains("SomethingBrandNew"))
+            #expect(message.contains("ZX-42"))
+            #expect(message.contains("Unexpected upstream rejection"))
+        } catch {
+            Issue.record("Expected AuthenticationError, got \(error).")
+        }
+    }
+
+    @Test func submitTwoFactorHumanizesInvalidOrAlreadyUsedCodes() async throws {
+        let webSession = FakeAuthenticationWebSession(
+            signInResponse: BrowserGraphQLResponse(
+                statusCode: 200,
+                body: """
+                {
+                  "data": {
+                    "account_signin": false
+                  },
+                  "errors": [
+                    {
+                      "message": "MultiStepRequired",
+                      "extensions": {
+                        "category": "authorization",
+                        "details": {
+                          "delivery": "email"
+                        }
+                      }
+                    }
+                  ]
+                }
+                """
+            ),
+            twoFactorResponse: BrowserGraphQLResponse(
+                statusCode: 200,
+                body: """
+                {
+                  "data": {
+                    "account_multistep": null
+                  },
+                  "errors": [
+                    {
+                      "message": "ErrValidationFailed",
+                      "extensions": {
+                        "category": "authorization",
+                        "details": {
+                          "code": "invalid or already used"
+                        }
+                      }
+                    }
+                  ]
+                }
+                """
+            )
+        )
+
+        let service = RSIAuthService(recaptchaBroker: webSession)
+        _ = try await service.signIn(
+            loginIdentifier: "pilot@example.com",
+            password: "secret-password",
+            rememberMe: true
+        )
+
+        do {
+            try await service.submitTwoFactor(
+                code: "123456",
+                deviceName: "iPhone",
+                trustDuration: .year
+            )
+            Issue.record("Expected the invalid verification code to throw an authentication error.")
+        } catch let error as AuthenticationError {
+            guard case let .signInFailed(message) = error else {
+                Issue.record("Expected a sign-in failure message, got \(error).")
+                return
+            }
+
+            #expect(message == "That verification code was not accepted. Use the newest RSI code and try again.")
+        } catch {
+            Issue.record("Expected AuthenticationError, got \(error).")
         }
     }
 
