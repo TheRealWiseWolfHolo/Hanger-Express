@@ -15,16 +15,28 @@ fail() {
   exit 1
 }
 
+grep_excluding_hygiene_script() {
+  grep -Ev '^scripts/check_repo_hygiene\.sh$'
+}
+
+find_forbidden_paths() {
+  grep -En "$forbidden_path_pattern" "$1"
+}
+
+find_forbidden_content_in_file() {
+  grep -En "$forbidden_content_pattern" "$1"
+}
+
 is_exempt_content_path() {
   [ "${1:-}" = "scripts/check_repo_hygiene.sh" ]
 }
 
 scan_repo() {
   tracked_list="$tmpdir/tracked.txt"
-  git ls-files | rg -v '^scripts/check_repo_hygiene\.sh$' > "$tracked_list"
+  git ls-files | grep_excluding_hygiene_script > "$tracked_list"
 
   forbidden_paths="$tmpdir/forbidden-paths.txt"
-  if rg -n "$forbidden_path_pattern" "$tracked_list" > "$forbidden_paths"; then
+  if find_forbidden_paths "$tracked_list" > "$forbidden_paths"; then
     printf '%s\n' 'Forbidden tracked export or signing artifacts detected:' >&2
     cat "$forbidden_paths" >&2
     exit 1
@@ -44,7 +56,7 @@ scan_staged() {
   [ -s "$staged_list" ] || exit 0
 
   forbidden_paths="$tmpdir/forbidden-staged-paths.txt"
-  if rg -n "$forbidden_path_pattern" "$staged_list" > "$forbidden_paths"; then
+  if find_forbidden_paths "$staged_list" > "$forbidden_paths"; then
     printf '%s\n' 'Forbidden export or signing artifacts are staged for commit:' >&2
     cat "$forbidden_paths" >&2
     exit 1
@@ -57,7 +69,7 @@ scan_staged() {
     fi
     staged_copy="$tmpdir/staged-file"
     git show ":$path" > "$staged_copy" 2>/dev/null || continue
-    if rg -n -I -e "$forbidden_content_pattern" "$staged_copy" > "$tmpdir/staged-hit.txt"; then
+    if find_forbidden_content_in_file "$staged_copy" > "$tmpdir/staged-hit.txt"; then
       printf '%s\n' "Sensitive content markers detected in staged file: $path" >&2
       cat "$tmpdir/staged-hit.txt" >&2
       exit 1
