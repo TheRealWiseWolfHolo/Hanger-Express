@@ -15,9 +15,13 @@ fail() {
   exit 1
 }
 
+is_exempt_content_path() {
+  [ "${1:-}" = "scripts/check_repo_hygiene.sh" ]
+}
+
 scan_repo() {
   tracked_list="$tmpdir/tracked.txt"
-  git ls-files > "$tracked_list"
+  git ls-files | rg -v '^scripts/check_repo_hygiene\.sh$' > "$tracked_list"
 
   forbidden_paths="$tmpdir/forbidden-paths.txt"
   if rg -n "$forbidden_path_pattern" "$tracked_list" > "$forbidden_paths"; then
@@ -26,7 +30,7 @@ scan_repo() {
     exit 1
   fi
 
-  if git grep -n -I -E "$forbidden_content_pattern" -- . > "$tmpdir/forbidden-content.txt"; then
+  if git grep -n -I -e "$forbidden_content_pattern" -- . ':(exclude)scripts/check_repo_hygiene.sh' > "$tmpdir/forbidden-content.txt"; then
     printf '%s\n' 'Sensitive content markers detected in tracked files:' >&2
     cat "$tmpdir/forbidden-content.txt" >&2
     exit 1
@@ -48,9 +52,12 @@ scan_staged() {
 
   while IFS= read -r path; do
     [ -n "$path" ] || continue
+    if is_exempt_content_path "$path"; then
+      continue
+    fi
     staged_copy="$tmpdir/staged-file"
     git show ":$path" > "$staged_copy" 2>/dev/null || continue
-    if rg -n -I -E "$forbidden_content_pattern" "$staged_copy" > "$tmpdir/staged-hit.txt"; then
+    if rg -n -I -e "$forbidden_content_pattern" "$staged_copy" > "$tmpdir/staged-hit.txt"; then
       printf '%s\n' "Sensitive content markers detected in staged file: $path" >&2
       cat "$tmpdir/staged-hit.txt" >&2
       exit 1
